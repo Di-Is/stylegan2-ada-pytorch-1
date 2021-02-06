@@ -71,7 +71,6 @@ def report_metric(result_dict, run_dir=None, snapshot_pkl=None):
         snapshot_pkl = os.path.relpath(snapshot_pkl, run_dir)
 
     jsonl_line = json.dumps(dict(result_dict, snapshot_pkl=snapshot_pkl, timestamp=time.time()))
-    print(jsonl_line)
     if run_dir is not None and os.path.isdir(run_dir):
         with open(os.path.join(run_dir, f'metric-{metric}.jsonl'), 'at') as f:
             f.write(jsonl_line + '\n')
@@ -82,7 +81,7 @@ def report_metric(result_dict, run_dir=None, snapshot_pkl=None):
 @register_metric
 def fid50k_full(opts):
     opts.dataset_kwargs.update(max_size=None, xflip=False)
-    fid = frechet_inception_distance.compute_fid(opts, max_real=None, num_gen=50000)
+    fid = frechet_inception_distance.compute_fid(opts, max_real=None, num_gen=1000)
     return dict(fid50k_full=fid)
 
 @register_metric

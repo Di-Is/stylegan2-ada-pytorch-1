@@ -91,7 +91,7 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--gpus', help='Number of GPUs to use', type=int, default=1, metavar='INT', show_default=True)
 @click.option('--verbose', help='Print optional information', type=bool, default=True, metavar='BOOL', show_default=True)
 
-def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose):
+def calc_metrics(ctx, network_pkl, metrics, data, mirror_x, mirror_y, rotate90, rotate180, gpus, verbose):
     """Calculate quality metrics for previous training run or pretrained network pickle.
 
     Examples:
@@ -155,9 +155,14 @@ def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose):
     # Finalize dataset options.
     args.dataset_kwargs.resolution = args.G.img_resolution
     args.dataset_kwargs.use_labels = (args.G.c_dim != 0)
-    if mirror is not None:
-        args.dataset_kwargs.xflip = mirror
-
+    if mirror_x is not None:
+        args.dataset_kwargs.xflip = mirror_x
+    if mirror_y is not None:
+        args.dataset_kwargs.yflip = mirror_y
+    if mirror_y is not None:
+        args.dataset_kwargs.rotate90 = rotate90
+    if mirror_y is not None:
+        args.dataset_kwargs.rotate180 = rotate180
     # Print dataset options.
     if args.verbose:
         print('Dataset options:')

@@ -16,6 +16,9 @@ import numpy as np
 import torch
 import dnnlib
 
+from tqdm import tqdm
+
+
 #----------------------------------------------------------------------------
 
 class MetricOptions:
@@ -190,7 +193,7 @@ def compute_feature_stats_for_dataset(opts, detector_url, detector_kwargs, rel_l
         md5 = hashlib.md5(repr(sorted(args.items())).encode('utf-8'))
         cache_tag = f'{dataset.name}-{get_feature_detector_name(detector_url)}-{md5.hexdigest()}'
         cache_file = dnnlib.make_cache_dir_path('gan-metrics', cache_tag + '.pkl')
-
+        print(cache_file)
         # Check if the file exists (all processes must agree).
         flag = os.path.isfile(cache_file) if opts.rank == 0 else False
         if opts.num_gpus > 1:
@@ -212,12 +215,16 @@ def compute_feature_stats_for_dataset(opts, detector_url, detector_kwargs, rel_l
 
     # Main loop.
     item_subset = [(i * opts.num_gpus + opts.rank) % num_items for i in range((num_items - 1) // opts.num_gpus + 1)]
+    pbar = tqdm(leave=False)
     for images, _labels in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset, batch_size=batch_size, **data_loader_kwargs):
         if images.shape[1] == 1:
             images = images.repeat([1, 3, 1, 1])
         features = detector(images.to(opts.device), **detector_kwargs)
         stats.append_torch(features, num_gpus=opts.num_gpus, rank=opts.rank)
         progress.update(stats.num_items)
+        pbar.update(batch_size)
+
+    pbar.close()
 
     # Save to cache.
     if cache_file is not None and opts.rank == 0:
@@ -256,6 +263,7 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
     progress = opts.progress.sub(tag='generator features', num_items=stats.max_items, rel_lo=rel_lo, rel_hi=rel_hi)
     detector = get_feature_detector(url=detector_url, device=opts.device, num_gpus=opts.num_gpus, rank=opts.rank, verbose=progress.verbose)
 
+    pbar = tqdm(leave=False)
     # Main loop.
     while not stats.is_full():
         images = []
@@ -264,12 +272,17 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
             c = [dataset.get_label(np.random.randint(len(dataset))) for _i in range(batch_gen)]
             c = torch.from_numpy(np.stack(c)).pin_memory().to(opts.device)
             images.append(run_generator(z, c))
+            pbar.update(batch_gen)
+
         images = torch.cat(images)
         if images.shape[1] == 1:
             images = images.repeat([1, 3, 1, 1])
         features = detector(images, **detector_kwargs)
         stats.append_torch(features, num_gpus=opts.num_gpus, rank=opts.rank)
         progress.update(stats.num_items)
+
+    pbar.close()
+
     return stats
 
 #----------------------------------------------------------------------------

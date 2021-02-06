@@ -22,6 +22,8 @@ from metrics import metric_main
 from torch_utils import training_stats
 from torch_utils import custom_ops
 
+import tqdm
+
 #----------------------------------------------------------------------------
 
 class UserError(Exception):
@@ -40,9 +42,12 @@ def setup_training_loop_kwargs(
     data       = None, # Training dataset (required): <path>
     cond       = None, # Train conditional model based on dataset labels: <bool>, default = False
     subset     = None, # Train with only N images: <int>, default = all
-    mirror     = None, # Augment dataset with x-flips: <bool>, default = False
+    mirror_x   = None, # Augment dataset with x-flips: <bool>, default = False
+    mirror_y   = None, # Augment dataset with y-flips: <bool>, default = Fals
+    rotate90   = None,
+    rotate180  = None,
 
-    # Base config.
+        # Base config.
     cfg        = None, # Base config: 'auto' (default), 'stylegan2', 'paper256', 'paper512', 'paper1024', 'cifar'
     gamma      = None, # Override R1 gamma: <float>
     kimg       = None, # Override training duration: <int>
@@ -134,12 +139,35 @@ def setup_training_loop_kwargs(
             args.training_set_kwargs.max_size = subset
             args.training_set_kwargs.random_seed = args.random_seed
 
-    if mirror is None:
-        mirror = False
-    assert isinstance(mirror, bool)
-    if mirror:
-        desc += '-mirror'
-        args.training_set_kwargs.xflip = True
+    if mirror_x is None:
+        mirror_x = False
+    if mirror_y is None:
+        mirror_y = False
+    if rotate90 is None:
+        rotate90 = False
+    if rotate180 is None:
+        rotate180 = False
+
+    assert isinstance(mirror_x, bool)
+    assert isinstance(mirror_y, bool)
+    assert isinstance(rotate90, bool)
+    assert isinstance(rotate180, bool)
+
+    if mirror_x:
+        desc += '-mirror_x'
+    if mirror_y:
+        desc += '-mirror_y'
+    if rotate90:
+        desc += '-rotate90'
+    if rotate180:
+        desc += '-rotate180'
+
+    args.training_set_kwargs.xflip = mirror_x
+    args.training_set_kwargs.yflip = mirror_y
+    args.training_set_kwargs.rotate90 = rotate90
+    args.training_set_kwargs.rotate180 = rotate180
+
+
 
     # ------------------------------------
     # Base config: cfg, gamma, kimg, batch
@@ -152,6 +180,7 @@ def setup_training_loop_kwargs(
 
     cfg_specs = {
         'auto':      dict(ref_gpus=-1, kimg=25000,  mb=-1, mbstd=-1, fmaps=-1,  lrate=-1,     gamma=-1,   ema=-1,  ramp=0.05, map=2), # Populated dynamically based on resolution and GPU count.
+        'auto3090':  dict(ref_gpus=-1, kimg=25000,  mb=-1, mbstd=-1, fmaps=-1,  lrate=-1,     gamma=-1,   ema=-1,  ramp=0.05, map=2),
         'stylegan2': dict(ref_gpus=8,  kimg=25000,  mb=32, mbstd=4,  fmaps=1,   lrate=0.002,  gamma=10,   ema=10,  ramp=None, map=8), # Uses mixed-precision, unlike the original StyleGAN2.
         'paper256':  dict(ref_gpus=8,  kimg=25000,  mb=64, mbstd=8,  fmaps=0.5, lrate=0.0025, gamma=1,    ema=20,  ramp=None, map=8),
         'paper512':  dict(ref_gpus=8,  kimg=25000,  mb=64, mbstd=8,  fmaps=1,   lrate=0.0025, gamma=0.5,  ema=20,  ramp=None, map=8),
@@ -167,6 +196,17 @@ def setup_training_loop_kwargs(
         res = args.training_set_kwargs.resolution
         spec.mb = max(min(gpus * min(4096 // res, 32), 64), gpus) # keep gpu memory consumption at bay
         spec.mbstd = min(spec.mb // gpus, 4) # other hyperparams behave more predictably if mbstd group size remains fixed
+        spec.fmaps = 1 if res >= 512 else 0.5
+        spec.lrate = 0.002 if res >= 1024 else 0.0025
+        spec.gamma = 0.0002 * (res ** 2) / spec.mb # heuristic formula
+        spec.ema = spec.mb * 10 / 32
+
+    if cfg == 'auto3090':
+        desc += f'{gpus:d}'
+        spec.ref_gpus = gpus
+        res = args.training_set_kwargs.resolution
+        spec.mb = gpus * 8 # keep gpu memory consumption at bay
+        spec.mbstd = min(spec.mb // gpus, 8) # other hyperparams behave more predictably if mbstd group size remains fixed
         spec.fmaps = 1 if res >= 512 else 0.5
         spec.lrate = 0.002 if res >= 1024 else 0.0025
         spec.gamma = 0.0002 * (res ** 2) / spec.mb # heuristic formula
@@ -279,6 +319,7 @@ def setup_training_loop_kwargs(
         'bgcf':   dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1, imgfilter=1),
         'bgcfn':  dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1, imgfilter=1, noise=1),
         'bgcfnc': dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1, imgfilter=1, noise=1, cutout=1),
+        'nebula': dict(xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1),
     }
 
     assert augpipe in augpipe_specs
@@ -403,10 +444,13 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--data', help='Training data (directory or zip)', metavar='PATH', required=True)
 @click.option('--cond', help='Train conditional model based on dataset labels [default: false]', type=bool, metavar='BOOL')
 @click.option('--subset', help='Train with only N images [default: all]', type=int, metavar='INT')
-@click.option('--mirror', help='Enable dataset x-flips [default: false]', type=bool, metavar='BOOL')
+@click.option('--mirror_x', help='Enable dataset x-flips [default: false]', type=bool, metavar='BOOL')
+@click.option('--mirror_y', help='Enable dataset y-flips [default: false]', type=bool, metavar='BOOL')
+@click.option('--rotate90', help='Enable dataset rotate90 [default: false]', type=bool, metavar='BOOL')
+@click.option('--rotate180', help='Enable dataset rotate180 [default: false]', type=bool, metavar='BOOL')
 
 # Base config.
-@click.option('--cfg', help='Base config [default: auto]', type=click.Choice(['auto', 'stylegan2', 'paper256', 'paper512', 'paper1024', 'cifar']))
+@click.option('--cfg', help='Base config [default: auto]', type=click.Choice(['auto', 'auto3090', 'stylegan2', 'paper256', 'paper512', 'paper1024', 'cifar']))
 @click.option('--gamma', help='Override R1 gamma', type=float)
 @click.option('--kimg', help='Override training duration', type=int, metavar='INT')
 @click.option('--batch', help='Override batch size', type=int, metavar='INT')
@@ -415,7 +459,7 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--aug', help='Augmentation mode [default: ada]', type=click.Choice(['noaug', 'ada', 'fixed']))
 @click.option('--p', help='Augmentation probability for --aug=fixed', type=float)
 @click.option('--target', help='ADA target value for --aug=ada', type=float)
-@click.option('--augpipe', help='Augmentation pipeline [default: bgc]', type=click.Choice(['blit', 'geom', 'color', 'filter', 'noise', 'cutout', 'bg', 'bgc', 'bgcf', 'bgcfn', 'bgcfnc']))
+@click.option('--augpipe', help='Augmentation pipeline [default: bgc]', type=click.Choice(['blit', 'geom', 'color', 'filter', 'noise', 'cutout', 'bg', 'bgc', 'bgcf', 'bgcfn', 'bgcfnc', 'nebula']))
 
 # Transfer learning.
 @click.option('--resume', help='Resume training [default: noresume]', metavar='PKL')
@@ -427,50 +471,14 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--nobench', help='Disable cuDNN benchmarking', type=bool, metavar='BOOL')
 @click.option('--workers', help='Override number of DataLoader workers', type=int, metavar='INT')
 
-def main(ctx, outdir, dry_run, **config_kwargs):
-    """Train a GAN using the techniques described in the paper
-    "Training Generative Adversarial Networks with Limited Data".
+def main(ctx, outdir: str, dry_run: bool, **config_kwargs):
+    """stylegan2-adaの学習を行う
 
-    Examples:
-
-    \b
-    # Train with custom dataset using 1 GPU.
-    python train.py --outdir=~/training-runs --data=~/mydataset.zip --gpus=1
-
-    \b
-    # Train class-conditional CIFAR-10 using 2 GPUs.
-    python train.py --outdir=~/training-runs --data=~/datasets/cifar10.zip \\
-        --gpus=2 --cfg=cifar --cond=1
-
-    \b
-    # Transfer learn MetFaces from FFHQ using 4 GPUs.
-    python train.py --outdir=~/training-runs --data=~/datasets/metfaces.zip \\
-        --gpus=4 --cfg=paper1024 --mirror=1 --resume=ffhq1024 --snap=10
-
-    \b
-    # Reproduce original StyleGAN2 config F.
-    python train.py --outdir=~/training-runs --data=~/datasets/ffhq.zip \\
-        --gpus=8 --cfg=stylegan2 --mirror=1 --aug=noaug
-
-    \b
-    Base configs (--cfg):
-      auto       Automatically select reasonable defaults based on resolution
-                 and GPU count. Good starting point for new datasets.
-      stylegan2  Reproduce results for StyleGAN2 config F at 1024x1024.
-      paper256   Reproduce results for FFHQ and LSUN Cat at 256x256.
-      paper512   Reproduce results for BreCaHAD and AFHQ at 512x512.
-      paper1024  Reproduce results for MetFaces at 1024x1024.
-      cifar      Reproduce results for CIFAR-10 at 32x32.
-
-    \b
-    Transfer learning source networks (--resume):
-      ffhq256        FFHQ trained at 256x256 resolution.
-      ffhq512        FFHQ trained at 512x512 resolution.
-      ffhq1024       FFHQ trained at 1024x1024 resolution.
-      celebahq256    CelebA-HQ trained at 256x256 resolution.
-      lsundog256     LSUN Dog trained at 256x256 resolution.
-      <PATH or URL>  Custom network pickle.
+    :param ctx: ?
+    :param outdir: 出力先のパス
+    :param dry_run: dry_run modeで実行するか。True: 設定だけ読み込み、学習は実行しない
     """
+
     dnnlib.util.Logger(should_flush=True)
 
     # Setup training options.
@@ -502,6 +510,9 @@ def main(ctx, outdir, dry_run, **config_kwargs):
     print(f'Image resolution:   {args.training_set_kwargs.resolution}')
     print(f'Conditional model:  {args.training_set_kwargs.use_labels}')
     print(f'Dataset x-flips:    {args.training_set_kwargs.xflip}')
+    print(f'Dataset y-flips:    {args.training_set_kwargs.yflip}')
+    print(f'Dataset rotate90:   {args.training_set_kwargs.rotate90}')
+    print(f'Dataset rotate180:  {args.training_set_kwargs.rotate180}')
     print()
 
     # Dry run?

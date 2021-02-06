@@ -28,6 +28,9 @@ class Dataset(torch.utils.data.Dataset):
         max_size    = None,     # Artificially limit the size of the dataset. None = no limit. Applied before xflip.
         use_labels  = False,    # Enable conditioning labels? False = label dimension is zero.
         xflip       = False,    # Artificially double the size of the dataset via x-flips. Applied after max_size.
+        yflip       = False,    # yflip
+        rotate90    = False,    # 90刻みの回転によるデータ拡張
+        rotate180   = False,
         random_seed = 0,        # Random seed to use when applying max_size.
     ):
         self._name = name
@@ -42,11 +45,62 @@ class Dataset(torch.utils.data.Dataset):
             np.random.RandomState(random_seed).shuffle(self._raw_idx)
             self._raw_idx = np.sort(self._raw_idx[:max_size])
 
-        # Apply xflip.
-        self._xflip = np.zeros(self._raw_idx.size, dtype=np.uint8)
+
+        # number of total data
+        num_aug_method = sum([xflip, yflip, rotate90 + rotate180])
+        num_tot = self._raw_idx.size * 2 ** num_aug_method
+        self._raw_idx = np.tile(self._raw_idx, 2**num_aug_method)
+
+        self._augment_flags = np.zeros((4, num_tot))
+
+        num_half_index = num_tot
+        num_aug = 0
+
+
         if xflip:
-            self._raw_idx = np.tile(self._raw_idx, 2)
-            self._xflip = np.concatenate([self._xflip, np.ones_like(self._xflip)])
+            assert num_half_index % 2 == 0
+            num_half_index = int(num_half_index / 2)
+
+            dummy = np.zeros(num_half_index)
+            flags = []
+            for i in range(2**num_aug):
+                flags += [dummy, np.ones_like(dummy)]
+            self._augment_flags[0, :] = np.concatenate(flags)
+            num_aug += 1
+
+        if yflip:
+            assert num_half_index % 2 == 0
+            num_half_index = int(num_half_index / 2)
+
+            dummy = np.zeros(num_half_index)
+            flags = []
+            for i in range(2**num_aug):
+                flags += [dummy, np.ones_like(dummy)]
+            self._augment_flags[1, :] = np.concatenate(flags)
+            num_aug += 1
+
+        if rotate90:
+            assert num_half_index % 2 == 0
+            num_half_index = int(num_half_index / 2)
+
+            dummy = np.zeros(num_half_index)
+            flags = []
+            for i in range(2**num_aug):
+                flags += [dummy, np.ones_like(dummy)]
+            self._augment_flags[2, :] = np.concatenate(flags)
+            num_aug += 1
+
+        if rotate180:
+            assert num_half_index % 2 == 0
+            num_half_index = int(num_half_index / 2)
+
+            dummy = np.zeros(num_half_index)
+            flags = []
+            for i in range(2**num_aug):
+                flags += [dummy, np.ones_like(dummy)]
+            self._augment_flags[3, :] = np.concatenate(flags)
+            num_aug += 1
+
 
     def _get_raw_labels(self):
         if self._raw_labels is None:
@@ -87,9 +141,27 @@ class Dataset(torch.utils.data.Dataset):
         assert isinstance(image, np.ndarray)
         assert list(image.shape) == self.image_shape
         assert image.dtype == np.uint8
-        if self._xflip[idx]:
+
+        # xflip
+        if self._augment_flags[0, idx]:
             assert image.ndim == 3 # CHW
             image = image[:, :, ::-1]
+
+        # yflip
+        if self._augment_flags[1, idx]:
+            assert image.ndim == 3 # CHW
+            image = image[:, ::-1, :]
+
+        # rotate90
+        if self._augment_flags[2, idx]:
+            assert image.ndim == 3 # CHW
+            image = np.rot90(image, k=1, axes=(1, 2))
+
+        # rotate180
+        if self._augment_flags[3, idx]:
+            assert image.ndim == 3 # CHW
+            image = np.rot90(image, k=2, axes=(1, 2))
+
         return image.copy(), self.get_label(idx)
 
     def get_label(self, idx):
